@@ -1,0 +1,306 @@
+#!/usr/bin/env python
+
+import copy
+import rospy
+import threading
+import numpy as np
+from interbotix_hand_joy.srv import GripperPosition, GripperPositionResponse, \
+    SetWaistAngle, SetWaistAngleResponse
+from geometry_msgs.msg import Pose
+from std_msgs.msg import Bool
+from std_srvs.srv import Trigger, TriggerResponse, SetBool, SetBoolResponse
+from interbotix_common_modules import angle_manipulation as ang
+from interbotix_common_modules import geometry as geom_help
+from interbotix_xs_modules.arm import InterbotixManipulatorXS
+from scipy.spatial.transform import Rotation as R
+
+class ArmRobot(object):
+    def __init__(self):
+        self.waist_step = 0.06
+        # tuning parameters
+        self.rotate_p = 0.25
+        self.translate_p = 0.1
+        self.rotate_step = 0.01
+        self.translate_step = 0.07
+        self.translate_threshold = 0.014
+        self.rotate_threshold = 0.02
+
+        self.gripper_pressure_step = 0.125
+        self.current_loop_rate = 25
+        self.current_torque_status = True
+        self.current_gripper_pressure = 0.5
+        self.loop_rates = {"course" : 25, "fine" : 25}
+        self.hand_msg = Pose()
+        self.hand_msg_time = rospy.Time(0.0)
+        self.hand_mutex = threading.Lock()
+        self.rate = rospy.Rate(self.current_loop_rate)
+        robot_model = rospy.get_param("~robot_model")
+        robot_name = rospy.get_namespace().strip("/")
+        self.armbot = InterbotixManipulatorXS(robot_model, robot_name=robot_name, moving_time=0.2, accel_time=0.1, init_node=False)
+        self.num_joints = self.armbot.arm.group_info.num_joints
+        self.waist_angle = 0.0;
+        self.waist_index = self.armbot.arm.group_info.joint_names.index("waist")
+        self.waist_ll = self.armbot.arm.group_info.joint_lower_limits[self.waist_index]
+        self.waist_ul = self.armbot.arm.group_info.joint_upper_limits[self.waist_index]
+        self.T_sy = np.identity(4)
+        self.T_yb = np.identity(4)
+        self.update_T_yb()
+        # initialize operation
+        self.enable_smooth_follow = False
+        rospy.Subscriber("commands/hand_pose", Pose, self.hand_pose_cb)
+        rospy.Service('commands/gripper_position', GripperPosition, self.handle_gripper_position)
+        rospy.Service('commands/go_home', Trigger, self.handle_go_home)
+        rospy.Service('commands/go_sleep', Trigger, self.handle_sleep)
+        rospy.Service('commands/toggle_hand_follow', SetBool, self.handle_toggle_hand_follow)
+        rospy.Service('commands/set_waist_angle', SetWaistAngle, self.handle_set_waist_angle)
+        self.pub_feasible = rospy.Publisher("feedback/hand_pose_feasible", Bool, queue_size=1)
+
+    ### @brief Helper function that updates the frequency at which the main control loop runs
+    ### @param loop_rate - desired loop frequency [Hz]
+    def update_speed(self, loop_rate):
+        self.current_loop_rate = loop_rate
+        self.rate = rospy.Rate(self.current_loop_rate)
+        rospy.loginfo("Current loop rate is %d Hz." % self.current_loop_rate)
+
+    ### @brief Helper function that calculates the pose of the end-effector w.r.t. T_y
+    def update_T_yb(self):
+        T_sb = self.armbot.arm.get_ee_pose_command()
+        rpy = ang.rotationMatrixToEulerAngles(T_sb[:3, :3])
+        self.T_sy[:2,:2] = ang.yawToRotationMatrix(rpy[2])
+        self.T_yb = np.dot(ang.transInv(self.T_sy), T_sb)
+
+    ### @brief Helper function that updates the gripper pressure
+    ### @param gripper_pressure - desired gripper pressure from 0 - 1
+    def update_gripper_pressure(self, gripper_pressure):
+        self.current_gripper_pressure = gripper_pressure
+        self.armbot.gripper.set_pressure(self.current_gripper_pressure)
+        rospy.loginfo("Gripper pressure is at %.2f%%." % (self.current_gripper_pressure * 100.0))
+
+    ### @brief Helper function that opens or closes the gripper
+    ### @param req - Service request
+    def handle_gripper_position(self, req):
+        response = GripperPositionResponse()
+        if (req.gripper_cmd == 1):
+            rospy.loginfo("opening")
+            self.armbot.gripper.open(delay=0)
+            response.mode_of_operation = 1
+            return response # Opening
+        elif (req.gripper_cmd == 0):
+            rospy.loginfo("closing")
+            self.armbot.gripper.close(delay=0)
+            response.mode_of_operation = 2
+            return response # Closing
+        response.mode_of_operation(0)
+        return response 
+
+    # handles service call, returns true once the arm is in sleep position
+    def handle_sleep(self, req):
+        prev_commands = self.armbot.arm.get_joint_commands()
+        self.armbot.arm.set_trajectory_time(1.5, 0.75)
+        # check if we have large waist angle
+        if (prev_commands != [] and prev_commands[0] > 0.05):
+            self.waist_angle = 0.0
+            self.armbot.arm.set_single_joint_position('waist', self.waist_angle, 1.5, 0.7)
+        self.armbot.arm.go_to_sleep_pose(1.5, 0.75)
+        self.update_T_yb()
+        self.armbot.arm.set_trajectory_time(0.2, 0.1)
+        return TriggerResponse(success=True) 
+
+    def go_home(self):
+        home_position = [self.waist_angle, 0.4, 0.4, 0.0, -0.8, 0.0]
+        self.armbot.arm.set_trajectory_time(1.5, 0.75)
+        self.armbot.arm.set_joint_positions(home_position, 1.5, 0.75)
+        self.update_T_yb()
+        self.armbot.arm.set_trajectory_time(0.2, 0.1)
+        return True
+
+    # handles service call, returns true once the arm is in home position
+    def handle_go_home(self, req):
+        self.go_home()
+        return TriggerResponse(success=True)  
+
+    # handles service call, returns true once the arm is in new home position
+    def handle_set_waist_angle(self, req):
+        # check that the last joint commands were not None (aka we didn't send any) or close to sleep
+        prev_commands = self.armbot.arm.get_joint_commands()
+        sleep_pos = list(self.armbot.arm.group_info.joint_sleep_positions)
+        if (prev_commands == [] or np.sum(abs(np.array(prev_commands) - np.array(sleep_pos))) < 0.1):
+            self.waist_angle = 0.0
+            self.go_home()
+        if (abs(self.waist_angle - req.waist_angle) > 3.14):
+            self.waist_angle += (req.waist_angle - self.waist_angle)/2
+            self.go_home()
+        self.waist_angle = req.waist_angle
+        self.go_home()
+        return SetWaistAngleResponse(success=True)  
+
+    # handles service call, sets the bool that enables hand following and return whatever the bool is set to
+    def handle_toggle_hand_follow(self, req):
+        self.enable_smooth_follow = req.data
+        return SetBoolResponse(success=self.enable_smooth_follow)  
+
+    ### @brief ROS Callback function that recieves ArmJoy messages
+    ### @param msg - ArmJoy ROS message
+    def hand_pose_cb(self, msg):
+        with self.hand_mutex:
+            self.hand_msg = copy.deepcopy(msg)
+            self.hand_msg_time = rospy.Time.now()
+
+        # Check the speed_cmd
+        # if (msg.speed_cmd == ArmJoy.SPEED_INC and self.current_loop_rate < 40):
+        #     self.update_speed(self.current_loop_rate + 1)
+        # elif (msg.speed_cmd == ArmJoy.SPEED_DEC and self.current_loop_rate > 10):
+        #     self.update_speed(self.current_loop_rate - 1)
+
+        # # Check the speed_toggle_cmd
+        # if (msg.speed_toggle_cmd == ArmJoy.SPEED_COURSE):
+        #     self.loop_rates["fine"] = self.current_loop_rate
+        #     rospy.loginfo("Switched to Course Control")
+        #     self.update_speed(self.loop_rates["course"])
+        # elif (msg.speed_toggle_cmd == ArmJoy.SPEED_FINE):
+        #     self.loop_rates["course"] = self.current_loop_rate
+        #     rospy.loginfo("Switched to Fine Control")
+        #     self.update_speed(self.loop_rates["fine"])
+
+        # # Check the gripper_cmd
+        # if (msg.gripper_cmd == ArmJoy.GRIPPER_OPEN):
+        #     self.armbot.gripper.open(delay=0)
+        # elif (msg.gripper_cmd == ArmJoy.GRIPPER_CLOSE):
+        #     self.armbot.gripper.close(delay=0)
+
+        # # Check the gripper_pwm_cmd
+        # if (msg.gripper_pwm_cmd == ArmJoy.GRIPPER_PWM_INC and self.current_gripper_pressure < 1):
+        #     self.update_gripper_pressure(self.current_gripper_pressure + self.gripper_pressure_step)
+        # elif (msg.gripper_pwm_cmd == ArmJoy.GRIPPER_PWM_DEC and self.current_gripper_pressure > 0):
+        #     self.update_gripper_pressure(self.current_gripper_pressure - self.gripper_pressure_step)
+
+        # # Check the torque_cmd
+        # if (msg.torque_cmd == ArmJoy.TORQUE_ON):
+        #     self.armbot.dxl.robot_torque_enable("group", "arm", True)
+        #     self.armbot.arm.capture_joint_positions()
+        #     self.update_T_yb()
+        #     self.current_torque_status = True
+        # elif (msg.torque_cmd == ArmJoy.TORQUE_OFF):
+        #     self.armbot.dxl.robot_torque_enable("group", "arm", False)
+        #     self.current_torque_status = False
+
+    def calculate_translate_step(self, error):
+        step_size = min(self.translate_step, abs(error) * self.translate_p)
+        step = step_size*np.sign(error)
+        return step
+
+    def calculate_rotate_step(self, error):
+        step_size = min(self.rotate_step, abs(error) * self.rotate_p)
+        step = step_size*np.sign(error)
+        return step
+
+
+    ### @brief Main control loop to manipulate the arm
+    def controller(self):
+
+        if (self.current_torque_status == False or not self.enable_smooth_follow): return
+
+        with self.hand_mutex:
+            msg = copy.deepcopy(self.hand_msg)
+        
+        if (rospy.Time.now() - self.hand_msg_time) > rospy.Duration(0.2):
+            return
+
+        # # Check the pose_cmd
+        # if (msg.pose_cmd != 0):
+        #     if (msg.pose_cmd == ArmJoy.HOME_POSE):
+        #         self.armbot.arm.go_to_home_pose(1.5, 0.75)
+        #     elif (msg.pose_cmd == ArmJoy.SLEEP_POSE):
+        #         self.armbot.arm.go_to_sleep_pose(1.5, 0.75)
+        #     self.update_T_yb()
+        #     self.armbot.arm.set_trajectory_time(0.2, 0.1)
+
+        # # Check the waist_cmd
+        # if (msg.waist_cmd != 0):
+        #     waist_position = self.armbot.arm.get_single_joint_command("waist")
+        #     if (msg.waist_cmd == ArmJoy.WAIST_CCW):
+        #         success = self.armbot.arm.set_single_joint_position("waist", waist_position + self.waist_step, 0.2, 0.1, False)
+        #         if (success == False and waist_position != self.waist_ul):
+        #             self.armbot.arm.set_single_joint_position("waist", self.waist_ul, 0.2, 0.1, False)
+        #     elif (msg.waist_cmd == ArmJoy.WAIST_CW):
+        #         success = self.armbot.arm.set_single_joint_position("waist", waist_position - self.waist_step, 0.2, 0.1, False)
+        #         if (success == False and waist_position != self.waist_ll):
+        #             self.armbot.arm.set_single_joint_position("waist", self.waist_ll, 0.2, 0.1, False)
+        #     self.update_T_yb()
+
+
+        # position_changed = msg.ee_x_cmd + msg.ee_z_cmd
+        # if (self.num_joints >= 6):
+        #     position_changed += msg.ee_y_cmd
+        # orientation_changed = msg.ee_roll_cmd + msg.ee_pitch_cmd
+
+
+        # if (position_changed + orientation_changed == 0): return
+
+        #custom: check if pose incremeted more than threshold in x, y, or z
+
+        #-1, 0, 1
+        inc_x = (abs(msg.position.x) > self.translate_threshold)
+        inc_y = (abs(msg.position.y) > self.translate_threshold)
+        inc_z = (abs(msg.position.z) > self.translate_threshold)
+
+        # Copy the most recent T_yb transform into a temporary variable
+        T_yb = np.array(self.T_yb)
+
+        # check ee_x_cmd
+        if (inc_x):
+            T_yb[0, 3] += self.calculate_translate_step(msg.position.x)
+
+        # check ee_y_cmd
+        if (inc_y):
+            T_yb[1, 3] += self.calculate_translate_step(msg.position.y)
+
+        # check ee_z_cmd
+        if (inc_z):
+            T_yb[2, 3] += self.calculate_translate_step(msg.position.z)
+
+        # transform incoming pose orientation to roll pitch yaw
+        q = msg.orientation
+        if geom_help.quaternion_is_valid(q):
+            rot = R.from_quat([q.x, q.y, q.z, q.w])
+            rpy_cmd = ang.rotationMatrixToEulerAngles(rot.as_dcm())
+            rpy = ang.rotationMatrixToEulerAngles(T_yb[:3, :3])
+
+            #-1, 0, 1
+            inc_roll = (abs(rpy_cmd[0]) > self.rotate_threshold)
+            inc_pitch = (abs(rpy_cmd[0]) > self.rotate_threshold)
+            inc_yaw = (abs(rpy_cmd[0]) > self.rotate_threshold)
+
+            if (inc_roll):
+                rpy[0] += self.calculate_rotate_step(rpy_cmd[0])
+
+            # check ee_y_cmd
+            if (inc_pitch):
+                rpy[1] += self.calculate_rotate_step(rpy_cmd[1])
+
+            # check ee_z_cmd
+            if (inc_yaw):
+                rpy[2] += self.calculate_rotate_step(rpy_cmd[2])
+
+            T_yb[:3,:3] = ang.eulerAnglesToRotationMatrix(rpy)
+
+        # Get desired transformation matrix of the end-effector w.r.t. the base frame
+        T_sd = np.dot(self.T_sy, T_yb)
+        _, success = self.armbot.arm.set_ee_pose_matrix(T_sd, self.armbot.arm.get_joint_commands(), True, 0.2, 0.1, False)
+        feedback = Bool()
+        if (success):
+            self.T_yb = np.array(T_yb)
+            feedback.data = True
+        else:
+            feedback.data = False
+        self.pub_feasible.publish(feedback)
+
+def main():
+    rospy.init_node('hand_joy')
+    arm = ArmRobot()
+    while not rospy.is_shutdown():
+        arm.controller()
+        arm.rate.sleep()
+
+if __name__=='__main__':
+    main()

@@ -1,0 +1,5 @@
+# requested joint angle command
+float32 waist_angle
+---
+# returns true if successful, false if not
+bool success

@@ -1,0 +1,5 @@
+# 1 for opening, 0 for closing the gripper
+int8 gripper_cmd
+---
+# returns 1 if opening the gripper, 2 if closing and 0 if failure
+int8 mode_of_operation
