@@ -17,3 +17,8 @@ This repository contains the setup instructions and the ROS controller for inter
 ## Questions / Issues
 
 For Questions or Issues with any of the packages, make an issue in this repository or [contact](mailto:jonbecke@student.ethz.ch) a team member directly. 
+
+## Demo video
+
+https://user-images.githubusercontent.com/64502909/158428145-7275c3c3-c668-4467-8702-ed863fb86a2b.mp4
+
